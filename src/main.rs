@@ -51,7 +51,7 @@ fn get_hash(uid: &str, path: &str) -> (String, String) {
     let filename = filepath.file_name().unwrap().to_string_lossy().to_string();
     let hash = get_sha1(format!("{uid}flyIT{path}").as_str());
     let h1 = &hash[0..1];
-    let h2 = &hash[0..2];
+    let h2 = &hash[1..2];
     (
         format!("/{h1}/{h2}/{uid}-{hash}"),
         format!("/{h1}/{h2}/{uid}-{hash}-{filename}"),
