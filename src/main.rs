@@ -1,12 +1,11 @@
 use axum::{
-    extract::Query,
-    http::{Uri, HeaderMap},
+    http::{Uri, HeaderMap, StatusCode},
     routing::get,
     Json, Router, response::IntoResponse,
 };
 use chrono::{Utc};
 use md5;
-use serde::Deserialize;
+// use serde::Deserialize;
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use std::fs;
@@ -27,10 +26,10 @@ fn get_sha1(input: &str) -> String {
     hash_str
 }
 
-#[derive(Deserialize, Debug)]
-struct QueryParams {
-    uid: String
-}
+// #[derive(Deserialize, Debug)]
+// struct QueryParams {
+//     uid: String
+// }
 
 #[tokio::main]
 async fn main() {
@@ -71,7 +70,7 @@ fn lookup_md5(uid: &str, path: &str) -> Option<String> {
     let hash: (String, String) = get_hash(uid, path);
     let md5_hash = format!("{:x}", md5::compute(format!("{uid}{}", hash.0)));
     if let Ok(md5) = fs::read_to_string(format!("files/ram/rtpurge/{}", md5_hash)) {
-        return Some(md5);
+        return Some(md5.replace("\r\n", "").replace("\n", ""));
     }
 
     let today = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
@@ -89,7 +88,12 @@ fn lookup_md5(uid: &str, path: &str) -> Option<String> {
         let lastchar = &hash.1[hash.1.len() - 1..];
         let cdb = cdb::CDB::open(format!("files/downloads/incoming/cdb/{lastchar}/{uid}.cdb"));
         lookup_cdb(&cdb, &hash.0).or(lookup_cdb(&cdb, &hash.1[1..]))
-    }).or(fs::read_to_string(format!("files/ram/DB/{}.basetime", uid)).ok())
+    }).or_else(|| {
+        if let Ok(md5) = fs::read_to_string(format!("files/ram/DB/{}.basetime", uid)) {
+            return Some(md5.replace("\r\n", "").replace("\n", ""));
+        }
+        else { return None; }
+    })
 }
 
 // fn write_to_cdb() -> () {
@@ -98,12 +102,24 @@ fn lookup_md5(uid: &str, path: &str) -> Option<String> {
 //     let _ = cdb.finish();
 // }
 
-async fn req_handler(Query(QueryParams { uid }): Query<QueryParams>, uri: Uri) -> impl IntoResponse {
+async fn req_handler(request_headers: HeaderMap, uri: Uri) -> impl IntoResponse {
     // write_to_cdb();
+    let uid: &str;
+    if let Some(uid_value) = request_headers.get("x-uid") {
+        if let Some(uid_value_to_str) = uid_value.to_str().ok() {
+            uid = uid_value_to_str
+        }
+        else {
+            return Err((StatusCode::BAD_REQUEST, "Missing x-uid header".to_string()));    
+        }
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Missing x-uid header".to_string()));
+    }
+
     let mut headers = HeaderMap::new();
     let md5 = lookup_md5(&uid, uri.path());
     let json_response = Json(json!({ "md5": md5 }));
     headers.insert("X-aanewmd5", md5.unwrap_or_default().parse().unwrap());
 
-    (headers, json_response)
+    Ok((headers, json_response))
 }
