@@ -13,15 +13,17 @@ use serde::Deserialize;
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use socket2::{Domain, Socket, Type};
+use url::Url;
 use std::{
     fs,
     net::{SocketAddr, TcpListener},
-    path::Path,
+    path::Path, collections::{HashMap, hash_map},
 };
 use std::{
     io::{self},
     process,
 };
+use rust_app::akamai_auth::{EdgeAuth, AuthOptions, Algorithm};
 
 fn get_sha1(input: &str) -> String {
     let mut hasher = Sha1::new();
@@ -189,23 +191,82 @@ fn lookup_md5(uid: &str, path: &str) -> Option<String> {
 //     let _ = cdb.finish();
 // }
 
+fn parse_token(input: &str, delimiter: char) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+
+    for pair in input.split(delimiter) {
+        let mut iter = pair.split('=');
+
+        if let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+            result.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    result
+}
+
+fn verify_request(secret: &str, uri: &Uri) -> bool {
+    const TOKEN_NAME: &str = "__token__";
+    const FIELD_DELIMITER: char = '~';
+    const ACL_DELIMITER: char = '!';
+
+    let url = Url::parse(&format!("http://localhost{}",uri.to_string())).unwrap();
+    let hash_query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    
+    let token_string = hash_query.get(TOKEN_NAME);
+
+    if token_string.is_none() {
+        return false;
+    }
+
+    let token_params = parse_token(token_string.unwrap(), FIELD_DELIMITER);
+
+    let mut ea = EdgeAuth{ options: AuthOptions {
+        escape_early: false,
+        verbose: true,
+        algorithm: Algorithm::SHA256,
+        start_time: token_params.get("st").and_then(|v| v.parse::<u64>().ok()),
+        end_time: token_params.get("exp").and_then(|v| v.parse::<u64>().ok()),
+        window_seconds: Some(10),
+        ip: token_params.get("ip").and_then(|v| Some(v.to_string())),
+        session_id: token_params.get("id").and_then(|v| Some(v.to_string())),
+        payload: token_params.get("data").and_then(|v| Some(v.to_string())),
+        salt: token_params.get("salt").and_then(|v| Some(v.to_string())),
+        field_delimiter: FIELD_DELIMITER,
+        acl_delimiter: ACL_DELIMITER,
+        token_type: None,
+        token_name: Some(TOKEN_NAME.to_string()),
+        key: secret.to_string(),
+    }};
+
+    ea.verify_token(token_string.unwrap(), uri.path(), false)
+}
+
 async fn req_handler(request_headers: HeaderMap, uri: Uri) -> impl IntoResponse {
     // write_to_cdb();
     println!("Processing request, PID: {}", process::id());
-    let uid: &str;
-    if let Some(uid_value) = request_headers.get("x-uid") {
-        if let Some(uid_value_to_str) = uid_value.to_str().ok() {
-            uid = uid_value_to_str
-        } else {
-            return Err((StatusCode::BAD_REQUEST, "Missing x-uid header".to_string()));
+
+    let should_verify_token = request_headers.get("x-akam-auth").map_or(false, |uid_value| { uid_value.to_str().ok().map_or(false, |v| { v == "1" }) });
+
+    if should_verify_token {
+        let secret = request_headers.get("x-akam-secret").and_then(|v| { v.to_str().ok() });
+        if secret.is_none() {
+            return Err((StatusCode::BAD_REQUEST, "Missing x-akam-secret header".to_string()));
         }
-    } else {
+
+        if !verify_request(secret.unwrap(), &uri) {
+            return Err((StatusCode::FORBIDDEN, "Forbidden access".to_string()));
+        }
+    }
+
+
+    let uid = request_headers.get("x-uid").and_then(|uid_value| uid_value.to_str().ok());
+    if uid.is_none() {
         return Err((StatusCode::BAD_REQUEST, "Missing x-uid header".to_string()));
     }
 
-    println!("uri path: {}", uri.path());
     let mut headers = HeaderMap::new();
-    let md5 = lookup_md5(uid, uri.path());
+    let md5 = lookup_md5(uid.unwrap(), uri.path());
     let json_response = Json(json!({ "md5": md5 }));
     headers.insert("X-aanewmd5", md5.unwrap_or_default().parse().unwrap());
 
